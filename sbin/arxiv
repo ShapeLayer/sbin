@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#
+# Install: cp arxiv ~/sbin/arxiv && chmod +x ~/sbin/arxiv
+# Downloader fallback order: curl > wget
+# Extractor fallback order: pup > htmlq > arxiv's Python virtual environment
+set -euo pipefail
+
+prog="$(basename "$0")"
+tmp=""
+runtime_dir="${ARXIV_RUNTIME_DIR:-$HOME/.cache/arxiv/.venv}"
+trap 'rm -f "${tmp:-}"' EXIT
+
+usage() {
+  cat <<EOF
+Usage:
+  $prog                              Show this help
+  $prog -h | --help | help           Show this help
+  $prog download <id|url>            Save div.ltx_page_main as <id>.html
+  $prog runtime install              Create/update the Python parser runtime
+  $prog runtime clear                Remove the Python parser runtime
+  $prog <id|url>                     Same as download (omit download)
+
+Examples:
+  $prog 2401.12345v2
+  $prog arXiv:2602.06154
+  $prog download https://arxiv.org/html/2401.12345v2
+  $prog runtime install
+EOF
+}
+
+runtime_python() {
+  printf '%s/bin/python\n' "$runtime_dir"
+}
+
+install_runtime() {
+  local python
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to install the parser runtime." >&2
+    return 1
+  fi
+
+  python="$(runtime_python)"
+  mkdir -p "$(dirname "$runtime_dir")"
+  if [[ ! -x "$python" ]]; then
+    python3 -m venv "$runtime_dir"
+  fi
+  "$python" -m pip install --upgrade beautifulsoup4
+  echo "Parser runtime installed: $runtime_dir"
+}
+
+clear_runtime() {
+  if [[ -e "$runtime_dir" ]]; then
+    rm -rf "$runtime_dir"
+    echo "Parser runtime removed: $runtime_dir"
+  else
+    echo "Parser runtime is not installed: $runtime_dir"
+  fi
+}
+
+ensure_runtime() {
+  local answer python
+  python="$(runtime_python)"
+
+  if [[ -x "$python" ]] && "$python" -c 'import bs4' >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ ! -t 0 || ! -t 2 ]]; then
+    echo "The HTML parser runtime is not installed. Run '$prog runtime install'." >&2
+    return 1
+  fi
+
+  printf "The HTML parser runtime is not installed. Install it now? [y/N] " >&2
+  read -r answer </dev/tty
+  case "$answer" in
+    y|Y|yes|YES|Yes)
+      install_runtime
+      ;;
+    *)
+      echo "HTML parsing requires the parser runtime." >&2
+      return 1
+      ;;
+  esac
+}
+
+extract() {
+  if command -v pup >/dev/null 2>&1; then
+    pup 'div.ltx_page_main' < "$tmp"
+  elif command -v htmlq >/dev/null 2>&1; then
+    htmlq 'div.ltx_page_main' < "$tmp"
+  else
+    ensure_runtime
+    "$(runtime_python)" - "$tmp" <<'PY'
+import sys
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    sys.exit("The parser runtime is missing beautifulsoup4.")
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    soup = BeautifulSoup(f.read(), "html.parser")
+node = soup.select_one("div.ltx_page_main")
+if node:
+    print(node)
+PY
+  fi
+}
+
+fetch() {
+  local url="$1"
+
+  if command -v curl >/dev/null 2>&1; then
+    final_url="$(curl -fsSL -A 'Mozilla/5.0' -w '%{url_effective}' -o "$tmp" "$url")"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --user-agent='Mozilla/5.0' -O "$tmp" "$url"
+    final_url="$url"
+  else
+    echo "Either curl or wget is required." >&2
+    return 1
+  fi
+}
+
+download() {
+  local input="$1" id url out final_url body
+
+  # 1) Parse the identifier (html/abs/pdf URL, query/fragment, trailing slash, .pdf)
+  id="${input#*://arxiv.org/}"
+  id="${id#html/}"; id="${id#abs/}"; id="${id#pdf/}"
+  if [[ "$id" =~ ^[Aa][Rr][Xx][Ii][Vv]: ]]; then
+    id="${id#*:}"
+  fi
+  id="${id%%[?#]*}"
+  id="${id%/}"
+  id="${id%.pdf}"
+  if [[ -z "$id" ]]; then
+    echo "Could not parse an identifier from: $input" >&2
+    return 1
+  fi
+
+  url="https://arxiv.org/html/${id}"
+  out="${id//\//_}.html"               # Replace '/' for legacy IDs such as hep-th/9901001
+
+  # 2) Fetch the page and follow redirects
+  tmp="$(mktemp)"
+  fetch "$url"
+  final_url="${final_url%/}/"          # Ensure a trailing slash for <base>
+
+  # 3) Extract div.ltx_page_main
+  body="$(extract)"
+  if [[ -z "$body" ]]; then
+    echo "Could not find div.ltx_page_main (the paper may not have an HTML version): $url" >&2
+    return 2
+  fi
+
+  # 4) Save with charset and base metadata for relative images and links
+  {
+    printf '<meta charset="utf-8">\n<base href="%s">\n' "$final_url"
+    printf '%s\n' "$body"
+  } > "$out"
+
+  echo "saved: $out  (source: $final_url)"
+}
+
+# ---- Command dispatch ----
+case "${1:-}" in
+  ""|-h|--help|help)
+    usage
+    ;;
+  download)
+    if [[ $# -ne 2 ]]; then
+      usage >&2
+      exit 1
+    fi
+    download "$2"
+    ;;
+  runtime)
+    case "${2:-}" in
+      install)
+        [[ $# -eq 2 ]] || { usage >&2; exit 1; }
+        install_runtime
+        ;;
+      clear)
+        [[ $# -eq 2 ]] || { usage >&2; exit 1; }
+        clear_runtime
+        ;;
+      *)
+        usage >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  -*)
+    echo "Unknown option: $1" >&2
+    usage >&2
+    exit 1
+    ;;
+  *)
+    if [[ $# -ne 1 ]]; then
+      usage >&2
+      exit 1
+    fi
+    download "$1"
+    ;;
+esac
