@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+#
+# Count text like Python's len('''...''').
+# Type text over multiple lines and finish it with '''.
+# The closing ''' can be on its own line or at the end of a text line.
+# Text after the closing ''' on the same line is ignored.
+#
+# Counting is done on UTF-8 bytes with tr/wc only, so the result does not
+# depend on the current locale:
+#   Characters  = Unicode code points (UTF-8 bytes that are not 10xxxxxx)
+#   UTF-16      = 2 bytes per code point + 2 more per 4-byte UTF-8 sequence
+#                 (surrogate pair), no BOM
+set -euo pipefail
+
+prog="$(basename "$0")"
+quote="'''"
+
+usage() {
+  cat <<EOF
+Usage:
+  $prog               Read text until ''' and print its counts
+  $prog -h | --help   Show this help
+
+Input starts after the opening ''' is shown. End it with '''.
+Ctrl-D (EOF) also ends the input.
+EOF
+}
+
+case "${1:-}" in
+  "") ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage >&2; exit 1 ;;
+esac
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+[[ -t 0 ]] && printf '%s\n' "$quote" >&2
+
+closed=0
+line=""
+while IFS= read -r line || [[ -n "$line" ]]; do
+  if [[ "$line" == *"$quote"* ]]; then
+    printf '%s' "${line%%"$quote"*}" >> "$tmp"
+    closed=1
+    break
+  fi
+  printf '%s\n' "$line" >> "$tmp"
+  line=""
+done
+
+if [[ "$closed" -eq 0 && -t 0 ]]; then
+  echo "(EOF reached before closing $quote)" >&2
+fi
+
+if command -v iconv >/dev/null 2>&1; then
+  if ! iconv -f UTF-8 -t UTF-8 < "$tmp" >/dev/null 2>&1; then
+    echo "Input is not valid UTF-8." >&2
+    exit 1
+  fi
+fi
+
+count() { wc -c | tr -d ' '; }
+
+bytes_utf8="$(count < "$tmp")"
+chars="$(LC_ALL=C tr -d '\200-\277' < "$tmp" | count)"
+astral="$(LC_ALL=C tr -cd '\360-\367' < "$tmp" | count)"
+bytes_utf16=$(( (chars + astral) * 2 ))
+newlines="$(LC_ALL=C tr -cd '\n' < "$tmp" | count)"
+lines="$newlines"
+if [[ "$bytes_utf8" -gt 0 ]] && [[ "$(tail -c 1 "$tmp" | od -An -c | tr -d ' ')" != '\n' ]]; then
+  lines=$(( lines + 1 ))
+fi
+
+unit() {
+  if [[ "$1" -eq 1 ]]; then printf '%s %s' "$1" "$2"; else printf '%s %ss' "$1" "$2"; fi
+}
+
+printf '%s\n' "$(unit "$chars" Character)"
+printf '%s\n' "$(unit "$lines" Line)"
+printf '%s (utf-8)\n' "$(unit "$bytes_utf8" Byte)"
+printf '%s (utf-16)\n' "$(unit "$bytes_utf16" Byte)"
